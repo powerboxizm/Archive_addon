@@ -6,6 +6,7 @@ const SHOW_NOT_WEB_READY = true; // true = never flag files as notWebReady, so m
 const MIN_MINUTES = 60; // movies, when runtime unknown
 const MIN_EPISODE_MINUTES = 8; // episodes, when runtime unknown
 const MAX_RESULTS = Infinity; // show every matching file found
+const MIN_PERCENT = 50; // hide weak matches (wrong item, wrong year, wrong length). Set 0 to show everything
 const MOVIE_CANDIDATES = 15;
 const SERIES_CANDIDATES = 30;
 const CONCURRENCY = 6;
@@ -20,12 +21,14 @@ const TIMEOUT_MS = 12000;
 
 const BAD_WORDS = /\b(trailers?|teasers?|clips?|scenes?|behind the scenes|making of|interviews?|podcast|commentary|review|reviews|reaction|soundtrack|score|gameplay|compilation|promo|tv spot)\b/i;
 
-const EXT_RANK = { mp4: 0, m4v: 1, webm: 2, mov: 3, mkv: 4, mpg: 5, mpeg: 5, ogv: 6, avi: 7, wmv: 8, flv: 9 };
+// Only these extensions are shown (lower number = listed first within an item).
+// To allow another type, add it back, e.g. ogv: 6, avi: 7, wmv: 8, flv: 9, mpg: 5, mpeg: 5
+const EXT_RANK = { mp4: 0, m4v: 1, webm: 2, mov: 3, mkv: 4 };
 const NOT_WEB_READY = new Set(["mkv", "avi", "ogv", "wmv", "flv", "mpg", "mpeg", "mov"]);
 
 const manifest = {
   id: "org.example.archivemoviesearch",
-  version: "1.3.0",
+  version: "1.6.0",
   name: "Internet Archive Movies & Shows",
   description: "Public domain and freely available movies and TV episodes from the Internet Archive",
   resources: ["stream"],
@@ -34,8 +37,49 @@ const manifest = {
   catalogs: [],
 };
 
+// "&" counts as "and"
 const norm = (s) =>
-  String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  String(s || "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+
+// title form used for matching: leading "The" dropped
+const normTitle = (s) => norm(s).replace(/^the /, "");
+// same, with all spaces removed: "SpiritedAway" and "Spirited Away" both become "spiritedaway"
+const squash = (s) => normTitle(s).replace(/ /g, "");
+
+const STOP = new Set(["the", "and", "of", "an", "to", "in", "is", "it", "for", "on", "with", "at", "by", "from"]);
+
+// distinctive words of a title
+const nameWords = (name) => [...new Set(normTitle(name).split(" ").filter((w) => w.length >= 2 && !STOP.has(w)))];
+// how many of those words must be present (titles under 3 words must match fully)
+const needWords = (n) => (n < 3 ? n : Math.ceil(n * 0.66));
+
+// Fuzzy "does this text contain this title?"
+//  - whole title as words, ignoring "The" and "&" vs "and"
+//  - or whole title with spaces ignored (SpiritedAway_1080p), for titles of 7+ letters
+//  - loose = true: also OK when most of the title's words are present (titles of 3+ words only)
+function titleIn(text, name, loose) {
+  const want = normTitle(name);
+  if (!want) return false;
+  const hay = ` ${normTitle(text)} `;
+  if (hay.includes(` ${want} `)) return true;
+  const sq = want.replace(/ /g, "");
+  if (sq.length >= 7 && hay.replace(/ /g, "").includes(sq)) return true;
+  if (!loose) return false;
+  const toks = nameWords(name);
+  if (toks.length < 3) return false;
+  const words = new Set(hay.trim().split(" "));
+  return toks.filter((w) => words.has(w)).length >= needWords(toks.length);
+}
+
+// title with the movie/show name taken out (used to spot junk words like "trailer")
+function stripName(title, name) {
+  let s = normTitle(title);
+  const want = normTitle(name);
+  if (want) s = s.replace(want, " ");
+  const sq = squash(name);
+  if (sq) s = s.replace(sq, " ");
+  return s;
+}
 
 const truncate = (s, n) => (s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s);
 const pad2 = (n) => String(n).padStart(2, "0");
@@ -129,25 +173,59 @@ async function archiveQuery(q, rows) {
   return data?.response?.docs || [];
 }
 
-async function searchArchive(name, series) {
+// Items that mention the IMDb id (description, subject or external-identifier) are flagged doc.imdb = true.
+async function searchArchive(name, series, imdbId) {
   const n = phrase(name);
-  const qs = [`title:"${n}" AND mediatype:movies`];
-  if (series) {
-    qs.push(`"${n}" AND mediatype:movies`); // matches subject / description too
-    if (phrase(series.epTitle).length >= 4) {
-      qs.push(`title:"${phrase(series.epTitle)}" AND "${n}" AND mediatype:movies`);
-    }
+  const jobs = [];
+
+  // title phrase, plus variants: "&" as "and", no leading "The", and with "&"/"and" removed
+  const variants = [
+    n,
+    n.replace(/&/g, "and").replace(/\s+/g, " ").trim(),
+    n.replace(/^the\s+/i, ""),
+    n.replace(/\s*(&|\band\b)\s*/gi, " ").replace(/\s+/g, " ").trim(),
+  ].filter((v, i, a) => v.length >= 3 && a.indexOf(v) === i);
+  for (const v of variants) jobs.push({ q: `title:"${v}" AND mediatype:movies`, imdb: false });
+
+  // no-space titles: SpiritedAway_1080p
+  const sq = squash(name);
+  if (sq.length >= 7) jobs.push({ q: `title:${sq}* AND mediatype:movies`, imdb: false });
+
+  // titles holding most of the words
+  const words = nameWords(name);
+  if (words.length >= 3) {
+    const top = [...words].sort((a, b) => b.length - a.length).slice(0, needWords(words.length));
+    jobs.push({ q: `title:(${top.join(" AND ")}) AND mediatype:movies`, imdb: false });
+  }
+
+  // matches subject / description too (movies and series)
+  jobs.push({ q: `"${n}" AND mediatype:movies`, imdb: false });
+
+  if (series && phrase(series.epTitle).length >= 4) {
+    jobs.push({ q: `title:"${phrase(series.epTitle)}" AND "${n}" AND mediatype:movies`, imdb: false });
+  }
+  if (/^tt\d+$/.test(imdbId || "")) {
+    jobs.push({ q: `"${imdbId}" AND mediatype:movies`, imdb: true });
+    jobs.push({ q: `external-identifier:"urn:imdb:${imdbId}" AND mediatype:movies`, imdb: true });
   }
   const lists = await Promise.all(
-    qs.map((q) =>
-      archiveQuery(q, series ? 50 : 40).catch((e) => {
-        console.log(`  search failed (${q}): ${e.message}`);
-        return [];
-      })
+    jobs.map((j) =>
+      archiveQuery(j.q, series ? 50 : 40)
+        .catch((e) => {
+          console.log(`  search failed (${j.q}): ${e.message}`);
+          return [];
+        })
+        .then((list) => list.map((d) => ({ ...d, imdb: j.imdb })))
     )
   );
   const seen = new Map();
-  for (const list of lists) for (const d of list) if (!seen.has(d.identifier)) seen.set(d.identifier, d);
+  for (const list of lists) {
+    for (const d of list) {
+      const prev = seen.get(d.identifier);
+      if (!prev) seen.set(d.identifier, d);
+      else if (d.imdb) prev.imdb = true; // title search found it first, IMDb search confirms it
+    }
+  }
   return [...seen.values()];
 }
 
@@ -160,7 +238,10 @@ function videoFiles(files) {
     })
     .filter(
       ({ f, ext }) =>
-        ext in EXT_RANK && f.source !== "metadata" && !/_thumb|sample|trailer/i.test(f.name.split("/").pop())
+        ext in EXT_RANK &&
+        f.source !== "metadata" &&
+        !/_thumb|sample|trailer/i.test(f.name.split("/").pop()) &&
+        !BAD_WORDS.test(norm(f.name.split("/").pop())) // extras, clips, "making of" etc. inside an item
     );
 }
 
@@ -171,16 +252,19 @@ const byQuality = (a, b) =>
 
 // ----- movies -----
 // returns ALL files in range, best first
-function pickMovieFile(files, runtime) {
+// verify = the item was found only by a loose match (description / most of the words),
+// so it needs a known runtime to check the file length against
+function pickMovieFile(files, runtime, verify) {
+  if (verify && !runtime) return [];
   const lo = runtime ? runtime * RUNTIME_LOW : MIN_MINUTES;
   const hi = runtime ? runtime * RUNTIME_HIGH : Infinity;
-  const inRange = videoFiles(files).filter(({ mins }) => mins === null || (mins >= lo && mins <= hi));
+  // unknown length is only allowed when we don't know the expected runtime either
+  const inRange = videoFiles(files).filter(({ mins }) => (mins === null ? !runtime : mins >= lo && mins <= hi));
   inRange.sort(byQuality);
   return inRange;
 }
 
 // ----- episodes -----
-const STOP = new Set(["the", "and", "of", "an", "to", "in", "is", "it", "for", "on", "with", "at", "by", "from"]);
 
 // does the text contain (most of) this episode title?
 function epTitleMatches(text, epTitle) {
@@ -278,11 +362,12 @@ function pickEpisodeFile(files, doc, season, ep, epTitle, runtime) {
 function moviePercent(item, picked, name, year, runtime) {
   let pts = 30;
   const t = item.title || "";
-  const leftover = norm(t.replace(/[\(\[].*?[\)\]]/g, " "))
-    .replace(norm(name), " ")
+  const nameToks = new Set(normTitle(name).split(" "));
+  const nsq = squash(name);
+  const leftover = normTitle(t.replace(/[\(\[].*?[\)\]]/g, " "))
     .replace(/\b(19|20)\d{2}\b/g, " ")
     .split(/\s+/)
-    .filter(Boolean).length;
+    .filter((w) => w && !nameToks.has(w) && w !== nsq).length;
   pts += leftover <= 2 ? 20 : leftover <= 4 ? 10 : 0;
   const itemYear = String(item.year || "");
   const titleYears = t.match(/\b(19|20)\d{2}\b/g) || [];
@@ -292,6 +377,7 @@ function moviePercent(item, picked, name, year, runtime) {
     const d = Math.abs(picked.mins - runtime) / runtime;
     pts += d <= 0.03 ? 30 : d <= 0.06 ? 24 : d <= 0.1 ? 16 : d <= 0.15 ? 8 : 0;
   } else pts += 12;
+  if (item.imdb) pts += 30; // IMDb id found in the upload's metadata
   return Math.min(100, Math.round(pts));
 }
 
@@ -327,6 +413,92 @@ async function lookupItem(doc, picker, series) {
   }
 }
 
+// ----- display helpers: language + quality -----
+const LANG_NAMES = {
+  eng: "English", en: "English",
+  jpn: "Japanese", ja: "Japanese", jp: "Japanese",
+  fre: "French", fra: "French", fr: "French",
+  ger: "German", deu: "German", de: "German",
+  spa: "Spanish", es: "Spanish",
+  ita: "Italian", it: "Italian",
+  rus: "Russian", ru: "Russian",
+  por: "Portuguese", pt: "Portuguese",
+  chi: "Chinese", zho: "Chinese", zh: "Chinese",
+  hin: "Hindi", hi: "Hindi",
+  tam: "Tamil", tel: "Telugu", ben: "Bengali", urd: "Urdu",
+  kor: "Korean", ko: "Korean",
+  ara: "Arabic", ar: "Arabic",
+  dut: "Dutch", nld: "Dutch", nl: "Dutch",
+  swe: "Swedish", sv: "Swedish",
+  nor: "Norwegian", dan: "Danish", fin: "Finnish",
+  pol: "Polish", pl: "Polish",
+  tur: "Turkish", tr: "Turkish",
+  gre: "Greek", ell: "Greek", heb: "Hebrew",
+  tha: "Thai", vie: "Vietnamese", ind: "Indonesian",
+  cze: "Czech", ces: "Czech", hun: "Hungarian", rum: "Romanian", ron: "Romanian",
+};
+
+// language from the item's metadata, plus dub/sub tags found in the names
+function languageLabel(doc, f) {
+  const raw = [].concat(doc.language || []).flatMap((x) => String(x).split(/[,;/|]+/));
+  const names = [];
+  for (const r of raw) {
+    const k = r.trim().toLowerCase();
+    if (!k || /^(und|unknown|undetermined|none|n\/a|zxx|mul)$/.test(k)) continue;
+    const name = LANG_NAMES[k] || (k.length > 3 ? k.charAt(0).toUpperCase() + k.slice(1) : "");
+    if (name && !names.includes(name)) names.push(name);
+  }
+  const text = norm(`${f.name.split("/").pop()} ${doc.title || ""}`);
+  const tags = [];
+  if (/\b(dual audio|multi audio)\b/.test(text)) tags.push("Dual audio");
+  if (/\b(dubbed|dub)\b/.test(text)) tags.push("Dubbed");
+  if (/\b(subbed|subtitled|eng subs?|english subs?|hardsubs?|hard subs?)\b/.test(text)) tags.push("Subbed");
+  const all = [...names.slice(0, 3), ...tags];
+  return all.length ? all.join(" · ") : "Language not listed";
+}
+
+// resolution from the file's real width/height when the Archive has it, else from the names
+function qualityInfo(f, doc) {
+  const text = norm(`${f.name.split("/").pop()} ${doc.title || ""}`);
+  const w = Number(f.width);
+  const h = Number(f.height);
+  let res = "";
+  let rank = 0;
+  const setRes = (label, r) => {
+    res = label;
+    rank = r;
+  };
+  if (w || h) {
+    const wide = w || (h * 16) / 9;
+    if (wide >= 3000) setRes("4K", 5);
+    else if (wide >= 1800) setRes("1080p", 4);
+    else if (wide >= 1200) setRes("720p", 3);
+    else if (wide >= 700) setRes("480p", 2);
+    else setRes(`${h || Math.round((w * 9) / 16)}p`, h >= 460 ? 2 : 1);
+  } else if (/\b(2160p|4k|uhd)\b/.test(text)) setRes("4K", 5);
+  else if (/\b(1080p|1080i|full hd|fhd)\b/.test(text)) setRes("1080p", 4);
+  else if (/\b720p\b/.test(text)) setRes("720p", 3);
+  else if (/\b(480p|576p)\b/.test(text)) setRes("480p", 2);
+  else if (/\b(360p|240p)\b/.test(text)) setRes("360p", 1);
+
+  const bits = [];
+  if (res) bits.push(res);
+  if (/\b(blu ray|bluray|bdrip|bd rip|brrip|br rip|bdremux|remux)\b/.test(text)) bits.push("BluRay");
+  else if (/\b(web dl|webdl|webrip|web rip)\b/.test(text)) bits.push("WEB");
+  else if (/\b(hdtv|pdtv|tvrip|tv rip)\b/.test(text)) bits.push("HDTV");
+  else if (/\b(dvdrip|dvd rip|dvdscr|dvd)\b/.test(text)) bits.push("DVD");
+  else if (/\b(vhsrip|vhs)\b/.test(text)) bits.push("VHS");
+  else if (/\b(camrip|hdcam|telesync|telecine|hdts)\b/.test(text)) bits.push("CAM");
+  if (/\b(x265|h 265|hevc)\b/.test(text)) bits.push("HEVC");
+  else if (/\b(x264|h 264|avc)\b/.test(text)) bits.push("H.264");
+  else if (/\bav1\b/.test(text)) bits.push("AV1");
+  else if (/\bxvid\b/.test(text)) bits.push("XviD");
+  if (/\bhdr(10)?\b/.test(text)) bits.push("HDR");
+  if (/\b(10 ?bit|hi ?10p?)\b/.test(text)) bits.push("10-bit");
+  return { label: bits.length ? bits.join(" · ") : "Quality unknown", rank };
+}
+// ----- end display helpers -----
+
 function cleanTitle(t, movieName) {
   let s = String(t || "").replace(/[_]+/g, " ");
   s = s.replace(/^\s*(watch|download|stream)\s+/i, "");
@@ -340,13 +512,12 @@ function cleanTitle(t, movieName) {
 function formatStream({ doc, picked }, ctx) {
   const { f, ext, mins } = picked;
   const { year, runtime, name, series } = ctx;
-  const titleHit = series && norm(doc.title).includes(norm(name));
+  const titleHit = series && (doc.imdb || titleIn(doc.title, name, false));
   const pct = series ? episodePercent(picked, runtime, titleHit) : moviePercent(doc, picked, name, year, runtime);
 
   const path = f.name.split("/").map(encodeURIComponent).join("/");
   const url = `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${path}`;
 
-  const lang = Array.isArray(doc.language) ? doc.language.join(", ") : doc.language;
   const itemYear = doc.year ? String(doc.year).slice(0, 4) : "";
   const size = fmtSize(f.size);
   const dl = fmtCount(Number(doc.downloads));
@@ -366,13 +537,18 @@ function formatStream({ doc, picked }, ctx) {
     lines.push(`▸  ${truncate(fileName.replace(/\.[a-z0-9]{2,4}$/i, ""), 45)}`);
   }
   lines.push(`◈  ${runtimeTxt} · ${[size, ext.toUpperCase()].filter(Boolean).join(" · ")}`);
+  const q = qualityInfo(f, doc);
+  lines.push(`◆  ${q.label}`);
+  lines.push(`◐  ${languageLabel(doc, f)}`);
   const extra = [`${pct}% match`];
-  if (lang) extra.push(truncate(String(lang), 20));
+  if (doc.imdb) extra.push("IMDb ✓");
+  if (doc.verify) extra.push("runtime-checked");
   if (dl) extra.push(`⇩ ${dl}`);
   lines.push(`◎  ${extra.join(" · ")}`);
 
   return {
     pct,
+    rank: q.rank,
     stream: {
       url,
       name: `🏛 Archive\n〈${series ? "Episode" : "Full Movie"}〉`,
@@ -385,7 +561,7 @@ function formatStream({ doc, picked }, ctx) {
   };
 }
 
-async function findStreams(meta, series) {
+async function findStreams(meta, series, imdbId) {
   const name = meta.name;
   const year = String(meta.year || meta.releaseInfo || "").slice(0, 4);
   const runtime = parseRuntime(meta.runtime);
@@ -394,42 +570,59 @@ async function findStreams(meta, series) {
       ` expected runtime: ${runtime || "unknown"}m`
   );
 
-  const docs = await searchArchive(name, series);
-  const wanted = norm(name);
+  const docs = await searchArchive(name, series, imdbId);
 
-  const mentions = (d) => norm(`${asText(d.subject)} ${asText(d.description)}`).includes(wanted);
-  const titled = (d) => norm(d.title).includes(wanted);
+  const titled = (d) => titleIn(d.title, name, false); // whole title (spaces / "The" / "&" ignored)
+  const looseTitled = (d) => titleIn(d.title, name, true); // ...or most of its words
+  const mentions = (d) => titleIn(`${asText(d.subject)} ${asText(d.description)}`, name, false);
 
+  // Movies found only by a loose match (description, or most of the words) must be verified:
+  // runtime known, file length within 15% of it, and the year must not contradict.
+  const needsCheck = (d) => !series && !d.imdb && !titled(d);
+  const yearOk = (d) => {
+    if (!year) return true;
+    const ys = [d.year, ...(String(d.title || "").match(/\b(?:19|20)\d{2}\b/g) || [])].map(Number).filter(Boolean);
+    return !ys.length || ys.some((y) => Math.abs(y - Number(year)) <= 1);
+  };
+
+  // IMDb-confirmed items skip the title and year checks (junk-word filter still applies)
   let candidates = docs
-    .filter((d) => titled(d) || (series && mentions(d)))
-    .filter((d) => !BAD_WORDS.test(norm(d.title).replace(wanted, " ")))
+    .filter((d) => d.imdb || looseTitled(d) || mentions(d))
+    .filter((d) => !BAD_WORDS.test(stripName(d.title, name)))
     .filter((d) => {
-      // movies only: item year (if any) must be within 1 year of the film
-      if (series || !year || !d.year) return true;
-      return Math.abs(Number(d.year) - Number(year)) <= 1;
-    });
-  // items with the show name in the title first, keeping download order within each group
-  candidates = [...candidates.filter(titled), ...candidates.filter((d) => !titled(d))].slice(
-    0,
-    series ? SERIES_CANDIDATES : MOVIE_CANDIDATES
-  );
+      if (d.imdb || series || !year) return true;
+      if (needsCheck(d)) return yearOk(d);
+      // item year (if any) must be within 1 year of the film
+      return !d.year || Math.abs(Number(d.year) - Number(year)) <= 1;
+    })
+    .map((d) => (needsCheck(d) ? { ...d, verify: true } : d));
+  // IMDb-confirmed first, then items with the name in the title, then loose matches; download order within each group
+  candidates = [
+    ...candidates.filter((d) => d.imdb),
+    ...candidates.filter((d) => !d.imdb && titled(d)),
+    ...candidates.filter((d) => !d.imdb && !titled(d)),
+  ].slice(0, series ? SERIES_CANDIDATES : MOVIE_CANDIDATES);
 
-  console.log(`  ${docs.length} hits, ${candidates.length} candidates`);
+  console.log(
+    `  ${docs.length} hits, ${candidates.length} candidates, ${candidates.filter((d) => d.imdb).length} IMDb-confirmed, ` +
+      `${candidates.filter((d) => d.verify).length} runtime-checked`
+  );
 
   const picker = series
     ? (files, doc) => {
-      // items found only via description/subject must name the show in the file path itself
-      const ok = titled(doc) ? files : files.filter((f) => norm(f.name).includes(wanted));
+      // items not clearly titled with the show must name it in the file path itself
+      const ok = doc.imdb || titled(doc) ? files : files.filter((f) => titleIn(f.name, name, false));
       return pickEpisodeFile(ok, doc, series.season, series.ep, series.epTitle, runtime);
     }
-    : (files) => pickMovieFile(files, runtime);
+    : (files, doc) => pickMovieFile(files, runtime, doc.verify);
 
   const looked = (await pool(candidates, CONCURRENCY, (d) => lookupItem(d, picker, series))).flat().filter(Boolean);
   const ctx = { year, runtime, name, series };
 
   return looked
     .map((x) => formatStream(x, ctx))
-    .sort((a, b) => b.pct - a.pct)
+    .filter((x) => x.pct >= MIN_PERCENT)
+    .sort((a, b) => b.pct - a.pct || b.rank - a.rank) // same match %: higher resolution first
     .slice(0, MAX_RESULTS)
     .map((x) => x.stream);
 }
@@ -456,7 +649,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
       series = { season, ep, epTitle: v ? v.name || v.title || "" : "" };
     }
 
-    const streams = await findStreams(meta, series);
+    const streams = await findStreams(meta, series, baseId);
     console.log(`  -> ${streams.length} Internet Archive result(s)`);
     if (streams.length) cache.set(id, { t: Date.now(), streams }); // don't cache empty/failed lookups
     return { streams };
