@@ -1,4 +1,6 @@
 const os = require("os");
+const fs = require("fs");
+const path = require("path");
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 
 const DEBUG = !!process.env.DEBUG; // DEBUG=1 npm start  -> prints file names of items that didn't match
@@ -18,6 +20,91 @@ const CACHE_MS = 6 * 60 * 60 * 1000;
 const CINEMETA = "https://v3-cinemeta.strem.io";
 const PORT = process.env.PORT || 7000;
 const TIMEOUT_MS = 12000;
+// Optional relay for Archive lookups (search + file lists only; video files still stream straight from archive.org)
+const ARCHIVE_API = (process.env.ARCHIVE_API || "https://archive.org").replace(/\/+$/, "");
+const ARCHIVE_KEY = process.env.ARCHIVE_KEY || "";
+
+// ---------- Result cache (optional, Upstash Redis REST) ----------
+// Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN to turn it on. Without them nothing changes.
+// Testing without a database: set CACHE_DIR=/some/folder and each cached title is saved there as a .json file.
+// The normal lookup always runs first. Only searches that FOUND results are stored, and a stored
+// entry is served instead of searching again until it expires.
+//   ia:search:<imdb id>[:season:episode]  the streams from the last successful search
+const DB_URL = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
+const DB_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const CACHE_DIR = process.env.CACHE_DIR || "";
+const DB_ON = !!(DB_URL && DB_TOKEN) || !!CACHE_DIR;
+const cacheFile = (id) => path.join(CACHE_DIR, String(id).replace(/[^a-zA-Z0-9._-]/g, "_") + ".json");
+const DB_TTL_SECONDS = 7 * 24 * 60 * 60; // entries expire after 7 days (lower = fresher links)
+const DB_REUSE_MS = DB_TTL_SECONDS * 1000;
+// A cached title is served instantly, but if it is older than this the add-on also searches again in the
+// background and updates the cache, so new uploads show up the next time the title is opened.
+const REFRESH_AFTER_MS = (Number(process.env.REFRESH_AFTER_HOURS) || 6) * 60 * 60 * 1000;
+
+async function dbPipeline(cmds) {
+  if (!DB_ON) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const res = await fetch(DB_URL + "/pipeline", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + DB_TOKEN, "content-type": "application/json" },
+      body: JSON.stringify(cmds),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.json();
+  } catch (e) {
+    const c = e.cause && (e.cause.code || e.cause.message);
+    console.log("  database error: " + e.message + (c ? " (" + c + ")" : ""));
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function dbGet(id) {
+  if (CACHE_DIR) {
+    try { return JSON.parse(fs.readFileSync(cacheFile(id), "utf8")); } catch (e) { return null; }
+  }
+  const out = await dbPipeline([["GET", "ia:search:" + id]]);
+  const raw = out && out[0] && out[0].result;
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function dbSave(rec) {
+  if (CACHE_DIR) {
+    try {
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+      fs.writeFileSync(cacheFile(rec.id), JSON.stringify(rec, null, 2));
+    } catch (e) { console.log("  cache file error: " + e.message); }
+    return Promise.resolve();
+  }
+  return dbPipeline([["SET", "ia:search:" + rec.id, JSON.stringify(rec), "EX", DB_TTL_SECONDS]]);
+}
+function fmtAgo(ms) {
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+// copy of the streams with a "Cached" line added (the stored copies stay untouched)
+function markCached(streams, at, refreshing) {
+  const line = `⚡  Cached · ${fmtAgo(Date.now() - at)}${refreshing ? " · refreshing" : ""}`;
+  return streams.map((x) => ({ ...x, title: `${x.title}\n${line}` }));
+}
+function dbDelete(id) {
+  if (CACHE_DIR) {
+    try { fs.unlinkSync(cacheFile(id)); } catch (e) {}
+    return Promise.resolve();
+  }
+  return dbPipeline([["DEL", "ia:search:" + id]]);
+}
+// ---------- end cache ----------
 
 const BAD_WORDS = /\b(trailers?|teasers?|clips?|scenes?|behind the scenes|making of|interviews?|podcast|commentary|review|reviews|reaction|soundtrack|score|gameplay|compilation|promo|tv spot)\b/i;
 
@@ -130,9 +217,14 @@ async function fetchJson(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: ctrl.signal });
+    const headers = ARCHIVE_KEY && ARCHIVE_API !== "https://archive.org" && url.startsWith(ARCHIVE_API) ? { "x-relay-key": ARCHIVE_KEY } : {};
+    const res = await fetch(url, { signal: ctrl.signal, headers });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
+  } catch (e) {
+    const c = e.cause && (e.cause.code || e.cause.message); // "fetch failed" hides the real reason
+    if (c) e.message += ` (${c})`;
+    throw e;
   } finally {
     clearTimeout(timer);
   }
@@ -169,7 +261,7 @@ async function archiveQuery(q, rows) {
   params.append("sort[]", "downloads desc");
   params.set("rows", String(rows));
   params.set("output", "json");
-  const data = await fetchJson(`https://archive.org/advancedsearch.php?${params}`);
+  const data = await fetchJson(`${ARCHIVE_API}/advancedsearch.php?${params}`);
   return data?.response?.docs || [];
 }
 
@@ -208,10 +300,12 @@ async function searchArchive(name, series, imdbId) {
     jobs.push({ q: `"${imdbId}" AND mediatype:movies`, imdb: true });
     jobs.push({ q: `external-identifier:"urn:imdb:${imdbId}" AND mediatype:movies`, imdb: true });
   }
+  let failed = 0;
   const lists = await Promise.all(
     jobs.map((j) =>
       archiveQuery(j.q, series ? 50 : 40)
         .catch((e) => {
+          failed++;
           console.log(`  search failed (${j.q}): ${e.message}`);
           return [];
         })
@@ -226,7 +320,9 @@ async function searchArchive(name, series, imdbId) {
       else if (d.imdb) prev.imdb = true; // title search found it first, IMDb search confirms it
     }
   }
-  return [...seen.values()];
+  const out = [...seen.values()];
+  out.failed = failed;
+  return out;
 }
 
 // All playable video files in an item
@@ -393,9 +489,9 @@ function episodePercent(picked, runtime, titleHit) {
 }
 
 // returns an array of { doc, picked } (one per matching file), or null
-async function lookupItem(doc, picker, series) {
+async function lookupItem(doc, picker, series, stats) {
   try {
-    const md = await fetchJson(`https://archive.org/metadata/${encodeURIComponent(doc.identifier)}`);
+    const md = await fetchJson(`${ARCHIVE_API}/metadata/${encodeURIComponent(doc.identifier)}`);
     if (!md || !md.files || md.is_dark) return null;
     const picked = picker(md.files, doc);
     if (!picked || !picked.length) {
@@ -408,6 +504,7 @@ async function lookupItem(doc, picker, series) {
     }
     return picked.map((p) => ({ doc, picked: p }));
   } catch (e) {
+    if (stats) stats.failed++;
     console.log(`  metadata failed for ${doc.identifier}: ${e.message}`);
     return null;
   }
@@ -616,43 +713,92 @@ async function findStreams(meta, series, imdbId) {
     }
     : (files, doc) => pickMovieFile(files, runtime, doc.verify);
 
-  const looked = (await pool(candidates, CONCURRENCY, (d) => lookupItem(d, picker, series))).flat().filter(Boolean);
+  const stats = { failed: 0 };
+  const looked = (await pool(candidates, CONCURRENCY, (d) => lookupItem(d, picker, series, stats))).flat().filter(Boolean);
   const ctx = { year, runtime, name, series };
 
-  return looked
+  const out = looked
     .map((x) => formatStream(x, ctx))
     .filter((x) => x.pct >= MIN_PERCENT)
     .sort((a, b) => b.pct - a.pct || b.rank - a.rank) // same match %: higher resolution first
     .slice(0, MAX_RESULTS)
     .map((x) => x.stream);
+  out.complete = docs.failed === 0 && stats.failed === 0;
+  return out;
 }
 // --------------------------------------
 
 const cache = new Map();
 const builder = new addonBuilder(manifest);
 
+// full lookup for one title/episode; updates the memory cache and the saved cache
+async function searchAndStore(type, id, isRefresh) {
+  const [baseId, s, e] = id.split(":");
+  const meta = await getMeta(type, baseId);
+  if (!meta) return null;
+
+  let series = null;
+  if (type === "series") {
+    const season = parseInt(s, 10);
+    const ep = parseInt(e, 10);
+    if (isNaN(season) || isNaN(ep)) return null;
+    const v = (meta.videos || []).find((x) => Number(x.season) === season && Number(x.episode) === ep);
+    series = { season, ep, epTitle: v ? v.name || v.title || "" : "" };
+  }
+
+  const streams = await findStreams(meta, series, baseId);
+  console.log(`  -> ${streams.length} Internet Archive result(s)${isRefresh ? " (background refresh)" : ""}`);
+  if (streams.length) cache.set(id, { t: Date.now(), at: Date.now(), streams }); // don't cache empty/failed lookups
+  // cache successful results only; empty or error-hit searches are never stored
+  if (DB_ON && streams.length && streams.complete) {
+    dbSave({
+      t: Date.now(), id, name: meta.name,
+      year: String(meta.year || meta.releaseInfo || "").slice(0, 4),
+      season: series ? series.season : null, ep: series ? series.ep : null,
+      count: streams.length, streams,
+    });
+  } else if (DB_ON && !streams.complete) console.log("  (search had errors, not cached)");
+  // a refresh that completed cleanly and found nothing means the old cached links are gone
+  if (isRefresh && streams.complete && !streams.length) {
+    cache.delete(id);
+    if (DB_ON) await dbDelete(id);
+    console.log("  (nothing found any more, removed from cache)");
+  }
+  return streams;
+}
+
+const refreshing = new Set();
+function refreshInBackground(type, id) {
+  if (refreshing.has(id)) return;
+  refreshing.add(id);
+  console.log("  (cached result is old, searching again in the background)");
+  searchAndStore(type, id, true)
+    .catch((e) => console.log("  background refresh failed: " + e.message))
+    .finally(() => refreshing.delete(id));
+}
+
 builder.defineStreamHandler(async ({ type, id }) => {
   if (type !== "movie" && type !== "series") return { streams: [] };
   const hit = cache.get(id);
-  if (hit && Date.now() - hit.t < CACHE_MS) return { streams: hit.streams };
+  if (hit && Date.now() - hit.t < CACHE_MS) {
+    const stale = Date.now() - hit.at > REFRESH_AFTER_MS;
+    console.log(`  -> ${hit.streams.length} result(s) from cache (memory), saved ${fmtAgo(Date.now() - hit.at)}`);
+    if (stale) refreshInBackground(type, id);
+    return { streams: markCached(hit.streams, hit.at, stale) };
+  }
   try {
-    const [baseId, s, e] = id.split(":");
-    const meta = await getMeta(type, baseId);
-    if (!meta) return { streams: [] };
-
-    let series = null;
-    if (type === "series") {
-      const season = parseInt(s, 10);
-      const ep = parseInt(e, 10);
-      if (isNaN(season) || isNaN(ep)) return { streams: [] };
-      const v = (meta.videos || []).find((x) => Number(x.season) === season && Number(x.episode) === ep);
-      series = { season, ep, epTitle: v ? v.name || v.title || "" : "" };
+    if (DB_ON) {
+      const stored = await dbGet(id);
+      if (stored && Array.isArray(stored.streams) && stored.streams.length && Date.now() - stored.t < DB_REUSE_MS) {
+        const stale = Date.now() - stored.t > REFRESH_AFTER_MS;
+        console.log(`  -> ${stored.streams.length} result(s) from cache (${CACHE_DIR ? "file" : "database"}), saved ${fmtAgo(Date.now() - stored.t)}`);
+        cache.set(id, { t: Date.now(), at: stored.t, streams: stored.streams });
+        if (stale) refreshInBackground(type, id);
+        return { streams: markCached(stored.streams, stored.t, stale) };
+      }
     }
-
-    const streams = await findStreams(meta, series, baseId);
-    console.log(`  -> ${streams.length} Internet Archive result(s)`);
-    if (streams.length) cache.set(id, { t: Date.now(), streams }); // don't cache empty/failed lookups
-    return { streams };
+    const streams = await searchAndStore(type, id, false);
+    return { streams: streams || [] };
   } catch (e) {
     console.log("Stream handler error:", e.message);
     return { streams: [] };
@@ -660,6 +806,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
 });
 
 serveHTTP(builder.getInterface(), { port: PORT });
+
+if (CACHE_DIR) {
+  try {
+    const n = fs.readdirSync(CACHE_DIR).filter((f) => f.endsWith(".json")).length;
+    console.log(`Cache folder: ${CACHE_DIR} (${n} saved title${n === 1 ? "" : "s"})`);
+  } catch (e) {
+    console.log(`Cache folder: ${CACHE_DIR} (empty, will be created)`);
+  }
+}
 
 let lan = null;
 try {
